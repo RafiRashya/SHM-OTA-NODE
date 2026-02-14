@@ -138,24 +138,24 @@ static void ble_app_on_sync(void) {
     ble_app_advertise();
 }
 
-// Task pengganti void loop() untuk mock data
+// Task untuk Mock Data Sensor
 void shm_data_task(void *pvParameter) {
     while(1) {
+        // HANYA proses data jika ada Gateway yang terkoneksi
         if (target_conn_handle != BLE_HS_CONN_HANDLE_NONE) {
-            // Mock data logika (sama seperti kode Arduino Anda)
+            
             current_shm_data.ax = (float)((int)esp_random() % 400 - 200) / 100.0f;
             current_shm_data.ay = (float)((int)esp_random() % 400 - 200) / 100.0f;
             current_shm_data.az = (float)((int)esp_random() % 120 + 900) / 100.0f;
 
-            // Trigger Notify: Beri tahu NimBLE bahwa nilai berubah
-            // NimBLE otomatis akan memanggil 'shm_gatt_access_cb' untuk mengambil data ini dan mengirimnya
+            // Trigger Notify ke Gateway (Fungsi ini bertipe void)
             ble_gatts_chr_updated(notify_char_val_handle);
             
-            printf("Notified -> AX:%.2f AY:%.2f AZ:%.2f\n", 
+            printf("[NODE] Data terkirim -> AX:%.2f AY:%.2f AZ:%.2f\n", 
                    current_shm_data.ax, current_shm_data.ay, current_shm_data.az);
         }
         
-        // Delay 1000ms menggunakan sistem FreeRTOS
+        // Delay 1 detik (Gunakan pdMS_TO_TICKS agar akurat di FreeRTOS)
         vTaskDelay(pdMS_TO_TICKS(1000));
     }
 }
