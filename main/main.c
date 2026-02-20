@@ -9,6 +9,8 @@
 #include "host/ble_hs.h"
 #include "services/gap/ble_svc_gap.h"
 #include "services/gatt/ble_svc_gatt.h"
+#include "esp_ota_ops.h"
+#include "esp_system.h"
 
 // UUID diconvert ke format Little-Endian (dibalik per-byte dari belakang ke depan)
 // Service: 12345678-1234-1234-1234-1234567890ab
@@ -22,6 +24,35 @@ static const ble_uuid128_t shm_chr_uuid = BLE_UUID128_INIT(
     0xab, 0x90, 0x78, 0x56, 0x34, 0x12, 0xef, 0xcd, 
     0xab, 0x90, 0x78, 0x56, 0x34, 0x12, 0xcd, 0xab
 );
+
+// === UUID UNTUK OTA SERVICE ===
+// Service OTA: 12345678-0000-0000-0000-1234567890ab (Contoh agar rapi)
+static const ble_uuid128_t ota_svc_uuid = BLE_UUID128_INIT(
+    0xab, 0x90, 0x78, 0x56, 0x34, 0x12, 0x00, 0x00, 
+    0x00, 0x00, 0x00, 0x00, 0x78, 0x56, 0x34, 0x12
+);
+
+// Karakteristik OTA Control: abcd1234-0001-0000-0000-1234567890ab
+static const ble_uuid128_t ota_chr_ctrl_uuid = BLE_UUID128_INIT(
+    0xab, 0x90, 0x78, 0x56, 0x34, 0x12, 0x00, 0x00, 
+    0x00, 0x00, 0x01, 0x00, 0x34, 0x12, 0xcd, 0xab
+);
+
+// Karakteristik OTA Data: abcd1234-0002-0000-0000-1234567890ab
+static const ble_uuid128_t ota_chr_data_uuid = BLE_UUID128_INIT(
+    0xab, 0x90, 0x78, 0x56, 0x34, 0x12, 0x00, 0x00, 
+    0x00, 0x00, 0x02, 0x00, 0x34, 0x12, 0xcd, 0xab
+);
+
+// === VARIABEL TRACKING OTA ===
+static esp_ota_handle_t ota_handle = 0;
+static const esp_partition_t *update_partition = NULL;
+static bool ota_is_running = false;
+static size_t ota_total_bytes = 0;
+
+// Deklarasi fungsi callback (akan kita isi nanti)
+static int ota_gatt_ctrl_cb(uint16_t conn_handle, uint16_t attr_handle, struct ble_gatt_access_ctxt *ctxt, void *arg);
+static int ota_gatt_data_cb(uint16_t conn_handle, uint16_t attr_handle, struct ble_gatt_access_ctxt *ctxt, void *arg);
 
 typedef struct __attribute__((packed)) {
     float ax;
@@ -48,8 +79,107 @@ static int shm_gatt_access_cb(uint16_t conn_handle, uint16_t attr_handle,
     return BLE_ATT_ERR_UNLIKELY;
 }
 
+// Callback untuk Karakteristik OTA Control (Menerima Perintah 0x01 atau 0x02)
+static int ota_gatt_ctrl_cb(uint16_t conn_handle, uint16_t attr_handle,
+                            struct ble_gatt_access_ctxt *ctxt, void *arg) {
+    if (ctxt->op == BLE_GATT_ACCESS_OP_WRITE_CHR) {
+        uint8_t cmd;
+        uint16_t len = OS_MBUF_PKTLEN(ctxt->om);
+        
+        if (len != 1) return BLE_ATT_ERR_INVALID_ATTR_VALUE_LEN;
+        os_mbuf_copydata(ctxt->om, 0, 1, &cmd);
+
+        if (cmd == 0x01) { // PERINTAH MULAI OTA
+            printf("\n[OTA] Menerima perintah START (0x01)\n");
+            
+            // Cari partisi memori yang nganggur
+            update_partition = esp_ota_get_next_update_partition(NULL);
+            if (update_partition == NULL) {
+                printf("[OTA] Error: Partisi OTA tidak ditemukan!\n");
+                return BLE_ATT_ERR_UNLIKELY;
+            }
+            
+            printf("[OTA] Menulis ke partisi: %s\n", update_partition->label);
+            
+            // Buka jalur penulisan Flash Memori (OTA_WITH_SEQUENTIAL_WRITES agar cepat)
+            esp_err_t err = esp_ota_begin(update_partition, OTA_WITH_SEQUENTIAL_WRITES, &ota_handle);
+            if (err != ESP_OK) {
+                printf("[OTA] Error esp_ota_begin: %s\n", esp_err_to_name(err));
+                return BLE_ATT_ERR_UNLIKELY;
+            }
+            
+            ota_is_running = true;
+            ota_total_bytes = 0;
+            printf("[OTA] OTA Dimulai! Menyiapkan pipa data...\n");
+        }
+        else if (cmd == 0x02) { // PERINTAH SELESAI OTA
+            if (!ota_is_running) return BLE_ATT_ERR_UNLIKELY;
+            
+            printf("\n[OTA] Menerima perintah END (0x02). Total data: %d bytes\n", ota_total_bytes);
+            
+            // Selesaikan dan validasi penulisan memori
+            esp_err_t err = esp_ota_end(ota_handle);
+            if (err != ESP_OK) {
+                printf("[OTA] Error esp_ota_end: %s (File mungkin korup)\n", esp_err_to_name(err));
+                ota_is_running = false;
+                return BLE_ATT_ERR_UNLIKELY;
+            }
+            
+            // Pindahkan jarum booting ke partisi yang baru
+            err = esp_ota_set_boot_partition(update_partition);
+            if (err != ESP_OK) {
+                printf("[OTA] Error mengatur partisi boot: %s\n", esp_err_to_name(err));
+                ota_is_running = false;
+                return BLE_ATT_ERR_UNLIKELY;
+            }
+            
+            printf("[OTA] FIRMWARE BERHASIL DIPERBARUI! Restarting dalam 3 detik...\n");
+            vTaskDelay(pdMS_TO_TICKS(3000));
+            esp_restart(); // Restart ESP32 otomatis ke program baru
+        }
+    }
+    return 0;
+}
+
+// Callback untuk Karakteristik OTA Data (Menerima Potongan File .bin)
+static int ota_gatt_data_cb(uint16_t conn_handle, uint16_t attr_handle,
+                            struct ble_gatt_access_ctxt *ctxt, void *arg) {
+    if (ctxt->op == BLE_GATT_ACCESS_OP_WRITE_CHR) {
+        // Tolak data jika Gateway belum mengirim perintah START (0x01)
+        if (!ota_is_running) return BLE_ATT_ERR_UNLIKELY; 
+
+        uint16_t len = OS_MBUF_PKTLEN(ctxt->om);
+        
+        // Buat buffer sementara untuk menampung data dari Bluetooth
+        uint8_t data_buf[512]; 
+        if (len > sizeof(data_buf)) return BLE_ATT_ERR_INSUFFICIENT_RES;
+
+        // Salin data dari Bluetooth ke buffer
+        os_mbuf_copydata(ctxt->om, 0, len, data_buf);
+
+        // Tulis langsung buffer ke Flash Memori
+        esp_err_t err = esp_ota_write(ota_handle, data_buf, len);
+        if (err != ESP_OK) {
+            printf("[OTA] Gagal menulis ke Flash: %s\n", esp_err_to_name(err));
+            esp_ota_abort(ota_handle);
+            ota_is_running = false;
+            return BLE_ATT_ERR_UNLIKELY;
+        }
+        
+        ota_total_bytes += len;
+        
+        // Cetak log setiap kelipatan ~10KB agar Serial Monitor tidak hang karena terlalu banyak print
+        if (ota_total_bytes % 10240 < len) { 
+            printf("[OTA] Menerima data: %d bytes...\n", ota_total_bytes);
+        }
+    }
+    return 0;
+}
+
 // 3. Tabel Konfigurasi Service dan Karakteristik GATT
+// Tabel Konfigurasi Service dan Karakteristik GATT
 static const struct ble_gatt_svc_def gatt_svr_svcs[] = {
+    // --- SERVICE 1: SHM DATA ---
     {
         .type = BLE_GATT_SVC_TYPE_PRIMARY,
         .uuid = &shm_svc_uuid.u,
@@ -60,7 +190,27 @@ static const struct ble_gatt_svc_def gatt_svr_svcs[] = {
                 .flags = BLE_GATT_CHR_F_READ | BLE_GATT_CHR_F_NOTIFY,
                 .val_handle = &notify_char_val_handle,
             },
-            { 0 } // Penutup array karakteristik
+            { 0 }
+        }
+    },
+    // --- SERVICE 2: OTA UPDATE ---
+    {
+        .type = BLE_GATT_SVC_TYPE_PRIMARY,
+        .uuid = &ota_svc_uuid.u,
+        .characteristics = (struct ble_gatt_chr_def[]) {
+            {
+                // Karakteristik Control (Untuk aba-aba)
+                .uuid = &ota_chr_ctrl_uuid.u,
+                .access_cb = ota_gatt_ctrl_cb,
+                .flags = BLE_GATT_CHR_F_WRITE | BLE_GATT_CHR_F_READ,
+            },
+            {
+                // Karakteristik Data (Pipa transfer firmware)
+                .uuid = &ota_chr_data_uuid.u,
+                .access_cb = ota_gatt_data_cb,
+                .flags = BLE_GATT_CHR_F_WRITE_NO_RSP, // Write tanpa response agar super cepat
+            },
+            { 0 }
         }
     },
     { 0 } // Penutup array service
