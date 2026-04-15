@@ -11,6 +11,7 @@
 #include "services/gatt/ble_svc_gatt.h"
 #include "esp_ota_ops.h"
 #include "esp_system.h"
+#include "esp_adc/adc_oneshot.h"
 
 // UUID diconvert ke format Little-Endian (dibalik per-byte dari belakang ke depan)
 // Service: 12345678-1234-1234-1234-1234567890ab
@@ -58,6 +59,7 @@ typedef struct __attribute__((packed)) {
     float ax;
     float ay;
     float az;
+    float vbatt;
 } SHMData;
 
 // Variabel Global
@@ -65,6 +67,8 @@ static uint8_t own_addr_type;
 static uint16_t target_conn_handle = BLE_HS_CONN_HANDLE_NONE;
 static uint16_t notify_char_val_handle;
 static SHMData current_shm_data; // Tempat menyimpan data terbaru
+// === HANDLE ADC BARU ===
+static adc_oneshot_unit_handle_t adc1_handle;
 
 static void ble_app_advertise(void);
 
@@ -294,18 +298,28 @@ void shm_data_task(void *pvParameter) {
         // HANYA proses data jika ada Gateway yang terkoneksi
         if (target_conn_handle != BLE_HS_CONN_HANDLE_NONE) {
             
+            // --- BACA TEGANGAN DARI PIN 1 (MENGGUNAKAN DRIVER BARU) ---
+            int raw_val = 0;
+            ESP_ERROR_CHECK(adc_oneshot_read(adc1_handle, ADC_CHANNEL_1, &raw_val));
+            
+            // Menggunakan pengali 1.75 dari kalibrasi pembagi tegangan 100k & 100k
+            float voltage = (raw_val / 4095.0) * 3.3 * 1.83; 
+            
+            // Isi data transmisi
             current_shm_data.ax = (float)((int)esp_random() % 400 - 200) / 100.0f;
             current_shm_data.ay = (float)((int)esp_random() % 400 - 200) / 100.0f;
             current_shm_data.az = (float)((int)esp_random() % 120 + 900) / 100.0f;
+            current_shm_data.vbatt = voltage; // Masukkan nilai tegangan
 
-            // Trigger Notify ke Gateway (Fungsi ini bertipe void)
+            // Trigger Notify ke Gateway 
             ble_gatts_chr_updated(notify_char_val_handle);
             
-            printf("[NODE] Data terkirim -> AX:%.2f AY:%.2f AZ:%.2f\n", 
-                   current_shm_data.ax, current_shm_data.ay, current_shm_data.az);
+            // Cetak ke Serial Monitor dengan format baru
+            printf("[NODE] Data terkirim -> AX:%.2f AY:%.2f AZ:%.2f | Vbatt: %.2fV\n", 
+                   current_shm_data.ax, current_shm_data.ay, current_shm_data.az, current_shm_data.vbatt);
         }
         
-        // Delay 1 detik (Gunakan pdMS_TO_TICKS agar akurat di FreeRTOS)
+        // Delay 1 detik
         vTaskDelay(pdMS_TO_TICKS(1000));
     }
 }
@@ -323,6 +337,19 @@ void app_main(void) {
         nvs_flash_erase();
         nvs_flash_init();
     }
+
+    // --- INISIALISASI ADC UNTUK BATERAI (PIN 1) ---
+    adc_oneshot_unit_init_cfg_t init_config1 = {
+        .unit_id = ADC_UNIT_1,
+    };
+    ESP_ERROR_CHECK(adc_oneshot_new_unit(&init_config1, &adc1_handle));
+
+    adc_oneshot_chan_cfg_t config = {
+        .bitwidth = ADC_BITWIDTH_DEFAULT, // Otomatis menyesuaikan resolusi terbaik (12-bit)
+        .atten = ADC_ATTEN_DB_12,         // Menggantikan DB_11
+    };
+    ESP_ERROR_CHECK(adc_oneshot_config_channel(adc1_handle, ADC_CHANNEL_1, &config));
+    // ----------------------------------------------
 
     // 2. Inisialisasi NimBLE
     nimble_port_init();
