@@ -12,8 +12,9 @@
 #include "esp_ota_ops.h"
 #include "esp_system.h"
 #include "esp_adc/adc_oneshot.h"
-#include "driver/i2c.h" // <--- TAMBAHAN: Driver I2C untuk Sensor
+#include "driver/i2c.h" 
 
+// --- PENYESUAIAN SISTEM 1: VERSI FIRMWARE ---
 #define FIRMWARE_VERSION "v1.0.0"
 
 // ================= KONFIGURASI I2C & ADXL345 =================
@@ -54,18 +55,18 @@ static const ble_uuid128_t ota_chr_data_uuid = BLE_UUID128_INIT(
     0x00, 0x00, 0x02, 0x00, 0x34, 0x12, 0xcd, 0xab
 );
 
-// Karakteristik OTA Version: abcd1234-0003-0000-0000-1234567890ab
+// --- PENYESUAIAN SISTEM 2: UUID VERSI ---
 static const ble_uuid128_t ota_chr_ver_uuid = BLE_UUID128_INIT(
     0xab, 0x90, 0x78, 0x56, 0x34, 0x12, 0x00, 0x00, 
     0x00, 0x00, 0x03, 0x00, 0x34, 0x12, 0xcd, 0xab
 );
 
-// Callback saat Gateway membaca versi
 static int ota_gatt_ver_cb(uint16_t conn_handle, uint16_t attr_handle,
                            struct ble_gatt_access_ctxt *ctxt, void *arg) {
     int rc = os_mbuf_append(ctxt->om, FIRMWARE_VERSION, strlen(FIRMWARE_VERSION));
     return rc == 0 ? 0 : BLE_ATT_ERR_INSUFFICIENT_RES;
 }
+// ----------------------------------------
 
 // === VARIABEL TRACKING OTA ===
 static esp_ota_handle_t ota_handle = 0;
@@ -109,11 +110,9 @@ static esp_err_t i2c_master_init(void) {
 }
 
 static void adxl345_init(void) {
-    // 1. Atur Data Format: Resolusi Penuh, Rentang +/- 16g (Nilai 0x0B)
     uint8_t format_cmd[2] = {ADXL345_REG_DATA_FORMAT, 0x0B};
     i2c_master_write_to_device(I2C_MASTER_NUM, ADXL345_ADDR, format_cmd, sizeof(format_cmd), 1000 / portTICK_PERIOD_MS);
 
-    // 2. Bangunkan Sensor: Set bit Measure di POWER_CTL (Nilai 0x08)
     uint8_t power_cmd[2] = {ADXL345_REG_POWER_CTL, 0x08};
     i2c_master_write_to_device(I2C_MASTER_NUM, ADXL345_ADDR, power_cmd, sizeof(power_cmd), 1000 / portTICK_PERIOD_MS);
     
@@ -205,6 +204,8 @@ static int ota_gatt_data_cb(uint16_t conn_handle, uint16_t attr_handle,
         }
         
         ota_total_bytes += len;
+        
+        // Cukup cetak setiap 10KB agar tidak memberatkan Node
         if (ota_total_bytes % 10240 < len) { 
             printf("[OTA] Menerima data: %d bytes...\n", ota_total_bytes);
         }
@@ -240,6 +241,7 @@ static const struct ble_gatt_svc_def gatt_svr_svcs[] = {
                 .access_cb = ota_gatt_data_cb,
                 .flags = BLE_GATT_CHR_F_WRITE_NO_RSP, 
             },
+            // --- PENYESUAIAN SISTEM 3: MENAMBAHKAN KARAKTERISTIK VERSI ---
             {
                 .uuid = &ota_chr_ver_uuid.u,
                 .access_cb = ota_gatt_ver_cb,
@@ -311,33 +313,29 @@ static void ble_app_on_sync(void) {
 
 // ================= TASK SENSOR UTAMA =================
 void shm_data_task(void *pvParameter) {
-    uint8_t data_raw[6]; // Buffer untuk menampung 6 byte data mentah (X, Y, Z)
+    uint8_t data_raw[6]; 
 
     while(1) {
-        if (target_conn_handle != BLE_HS_CONN_HANDLE_NONE) {
+        // HAPUS SYARAT !ota_is_running AGAR SENSOR TETAP AKTIF SAAT OTA
+        if (target_conn_handle != BLE_HS_CONN_HANDLE_NONE && !ota_is_running) {
             
-            // --- 1. BACA TEGANGAN BATERAI ---
             int raw_val = 0;
             ESP_ERROR_CHECK(adc_oneshot_read(adc1_handle, ADC_CHANNEL_1, &raw_val));
             float voltage = (raw_val / 4095.0) * 3.3 * 1.83; 
 
-            // --- 2. BACA SENSOR ADXL345 ASLI ---
-            // Minta 6 byte data mulai dari register DATAX0 (0x32)
             uint8_t reg_addr = ADXL345_REG_DATAX0;
             i2c_master_write_read_device(I2C_MASTER_NUM, ADXL345_ADDR, &reg_addr, 1, data_raw, 6, 1000 / portTICK_PERIOD_MS);
 
-            // Gabungkan 2 byte (LSB dan MSB) menjadi 1 angka integer (karena ADXL345 adalah sensor 13-bit)
             int16_t x_int = (data_raw[1] << 8) | data_raw[0];
             int16_t y_int = (data_raw[3] << 8) | data_raw[2];
             int16_t z_int = (data_raw[5] << 8) | data_raw[4];
 
-            // Konversi nilai integer ke satuan G (Gravitasi). Pengali standar adalah 0.0039g per LSB untuk mode Full Resolution.
             current_shm_data.ax = x_int * 0.0039f;
             current_shm_data.ay = y_int * 0.0039f;
             current_shm_data.az = z_int * 0.0039f;
             current_shm_data.vbatt = voltage; 
 
-            // Trigger Notify ke Gateway 
+            // Trigger Notify ke Gateway secara konstan untuk menjaga radio BLE tetap "Hot"
             ble_gatts_chr_updated(notify_char_val_handle);
             
             printf("[NODE] AX:%.2f AY:%.2f AZ:%.2f | Vbatt: %.2fV\n", 
@@ -355,14 +353,12 @@ void ble_host_task(void *param) {
 }
 
 void app_main(void) {
-    // 1. Inisialisasi Flash (Wajib)
     esp_err_t ret = nvs_flash_init();
     if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
         nvs_flash_erase();
         nvs_flash_init();
     }
 
-    // --- INISIALISASI ADC UNTUK BATERAI (PIN 1) ---
     adc_oneshot_unit_init_cfg_t init_config1 = {
         .unit_id = ADC_UNIT_1,
     };
@@ -373,30 +369,24 @@ void app_main(void) {
         .atten = ADC_ATTEN_DB_12,         
     };
     ESP_ERROR_CHECK(adc_oneshot_config_channel(adc1_handle, ADC_CHANNEL_1, &config));
-    // ----------------------------------------------
 
-    // --- INISIALISASI I2C DAN SENSOR ADXL345 ---
     ESP_ERROR_CHECK(i2c_master_init());
     adxl345_init();
-    // -------------------------------------------
 
-    // 2. Inisialisasi NimBLE
     nimble_port_init();
+    
+    // --- PENYESUAIAN SISTEM 5: UNCOMMENT MTU 512 ---
     ble_att_set_preferred_mtu(512);
 
-    // 3. Daftarkan Service & Karakteristik GATT
     ble_svc_gap_init();
     ble_svc_gatt_init();
     ble_gatts_count_cfg(gatt_svr_svcs);
     ble_gatts_add_svcs(gatt_svr_svcs);
 
-    // 4. Konfigurasi Device
     ble_svc_gap_device_name_set("SHM_Node_C3");
     ble_hs_cfg.sync_cb = ble_app_on_sync;
 
-    // 5. Jalankan Task
     nimble_port_freertos_init(ble_host_task);
     
-    // 6. Buat task untuk Loop Sensor Data
     xTaskCreate(shm_data_task, "shm_task", 4096, NULL, 5, NULL);
 }
