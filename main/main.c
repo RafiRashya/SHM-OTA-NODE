@@ -14,6 +14,8 @@
 #include "esp_adc/adc_oneshot.h"
 #include "driver/i2c.h" // <--- TAMBAHAN: Driver I2C untuk Sensor
 
+#define FIRMWARE_VERSION "v1.0.0"
+
 // ================= KONFIGURASI I2C & ADXL345 =================
 #define I2C_MASTER_SCL_IO           3       // Pin SCL
 #define I2C_MASTER_SDA_IO           2       // Pin SDA
@@ -51,6 +53,19 @@ static const ble_uuid128_t ota_chr_data_uuid = BLE_UUID128_INIT(
     0xab, 0x90, 0x78, 0x56, 0x34, 0x12, 0x00, 0x00, 
     0x00, 0x00, 0x02, 0x00, 0x34, 0x12, 0xcd, 0xab
 );
+
+// Karakteristik OTA Version: abcd1234-0003-0000-0000-1234567890ab
+static const ble_uuid128_t ota_chr_ver_uuid = BLE_UUID128_INIT(
+    0xab, 0x90, 0x78, 0x56, 0x34, 0x12, 0x00, 0x00, 
+    0x00, 0x00, 0x03, 0x00, 0x34, 0x12, 0xcd, 0xab
+);
+
+// Callback saat Gateway membaca versi
+static int ota_gatt_ver_cb(uint16_t conn_handle, uint16_t attr_handle,
+                           struct ble_gatt_access_ctxt *ctxt, void *arg) {
+    int rc = os_mbuf_append(ctxt->om, FIRMWARE_VERSION, strlen(FIRMWARE_VERSION));
+    return rc == 0 ? 0 : BLE_ATT_ERR_INSUFFICIENT_RES;
+}
 
 // === VARIABEL TRACKING OTA ===
 static esp_ota_handle_t ota_handle = 0;
@@ -225,6 +240,11 @@ static const struct ble_gatt_svc_def gatt_svr_svcs[] = {
                 .access_cb = ota_gatt_data_cb,
                 .flags = BLE_GATT_CHR_F_WRITE_NO_RSP, 
             },
+            {
+                .uuid = &ota_chr_ver_uuid.u,
+                .access_cb = ota_gatt_ver_cb,
+                .flags = BLE_GATT_CHR_F_READ,
+            },
             { 0 }
         }
     },
@@ -362,6 +382,7 @@ void app_main(void) {
 
     // 2. Inisialisasi NimBLE
     nimble_port_init();
+    ble_att_set_preferred_mtu(512);
 
     // 3. Daftarkan Service & Karakteristik GATT
     ble_svc_gap_init();
