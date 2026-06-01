@@ -324,18 +324,29 @@ void shm_data_task(void *pvParameter) {
             float voltage = (raw_val / 4095.0) * 3.3 * 1.83; 
 
             uint8_t reg_addr = ADXL345_REG_DATAX0;
-            i2c_master_write_read_device(I2C_MASTER_NUM, ADXL345_ADDR, &reg_addr, 1, data_raw, 6, 1000 / portTICK_PERIOD_MS);
+            
+            // 1. TANGKAP STATUS ERROR I2C
+            esp_err_t err = i2c_master_write_read_device(I2C_MASTER_NUM, ADXL345_ADDR, &reg_addr, 1, data_raw, 6, 1000 / portTICK_PERIOD_MS);
 
-            int16_t x_int = (data_raw[1] << 8) | data_raw[0];
-            int16_t y_int = (data_raw[3] << 8) | data_raw[2];
-            int16_t z_int = (data_raw[5] << 8) | data_raw[4];
+            // 2. JIKA SUKSES, UPDATE DATA
+            if (err == ESP_OK) {
+                int16_t x_int = (data_raw[1] << 8) | data_raw[0];
+                int16_t y_int = (data_raw[3] << 8) | data_raw[2];
+                int16_t z_int = (data_raw[5] << 8) | data_raw[4];
 
-            current_shm_data.ax = x_int * 0.0039f;
-            current_shm_data.ay = y_int * 0.0039f;
-            current_shm_data.az = z_int * 0.0039f;
+                current_shm_data.ax = x_int * 0.0039f;
+                current_shm_data.ay = y_int * 0.0039f;
+                current_shm_data.az = z_int * 0.0039f;
+            } else {
+                // 3. JIKA GAGAL, CETAK ERROR KE SERIAL & NOL KAN DATA
+                printf("[HW ERROR] Gagal membaca ADXL345! Cek Kabel (Status: %s)\n", esp_err_to_name(err));
+                current_shm_data.ax = 0.0f;
+                current_shm_data.ay = 0.0f;
+                current_shm_data.az = 0.0f;
+            }
+
             current_shm_data.vbatt = voltage; 
 
-            // Trigger Notify ke Gateway secara konstan untuk menjaga radio BLE tetap "Hot"
             ble_gatts_chr_updated(notify_char_val_handle);
             
             printf("[NODE] AX:%.2f AY:%.2f AZ:%.2f | Vbatt: %.2fV\n", 
@@ -371,6 +382,29 @@ void app_main(void) {
     ESP_ERROR_CHECK(adc_oneshot_config_channel(adc1_handle, ADC_CHANNEL_1, &config));
 
     ESP_ERROR_CHECK(i2c_master_init());
+
+    // === KODE I2C SCANNER ESP-IDF V5 ===
+    printf("\n[RADAR] Memulai I2C Scanner...\n");
+    int devices_found = 0;
+    for (uint8_t i = 1; i < 127; i++) {
+        i2c_cmd_handle_t cmd = i2c_cmd_link_create();
+        i2c_master_start(cmd);
+        i2c_master_write_byte(cmd, (i << 1) | I2C_MASTER_WRITE, true); // Kirim 1 bit ACK
+        i2c_master_stop(cmd);
+        
+        esp_err_t ret = i2c_master_cmd_begin(I2C_MASTER_NUM, cmd, 100 / portTICK_PERIOD_MS);
+        i2c_cmd_link_delete(cmd);
+        
+        if (ret == ESP_OK) {
+            printf("[RADAR] ==> SENSOR DITEMUKAN PADA ALAMAT: 0x%02X <==\n", i);
+            devices_found++;
+        }
+    }
+    if (devices_found == 0) {
+        printf("[RADAR] KOSONG! Tidak ada satupun sensor yang terdeteksi.\n");
+    }
+    printf("[RADAR] Scan Selesai.\n\n");
+    // ===================================
     adxl345_init();
 
     nimble_port_init();
