@@ -12,7 +12,9 @@
 #include "esp_ota_ops.h"
 #include "esp_system.h"
 #include "esp_adc/adc_oneshot.h"
-#include "driver/i2c.h" 
+#include "driver/i2c.h"
+#include "esp_pm.h" 
+#include "driver/gpio.h"
 
 // --- PENYESUAIAN SISTEM 1: VERSI FIRMWARE ---
 #define FIRMWARE_VERSION "v1.0.0"
@@ -73,6 +75,7 @@ static esp_ota_handle_t ota_handle = 0;
 static const esp_partition_t *update_partition = NULL;
 static bool ota_is_running = false;
 static size_t ota_total_bytes = 0;
+static esp_pm_lock_handle_t ota_pm_lock;
 
 static int ota_gatt_ctrl_cb(uint16_t conn_handle, uint16_t attr_handle, struct ble_gatt_access_ctxt *ctxt, void *arg);
 static int ota_gatt_data_cb(uint16_t conn_handle, uint16_t attr_handle, struct ble_gatt_access_ctxt *ctxt, void *arg);
@@ -118,6 +121,16 @@ static void adxl345_init(void) {
     
     printf("[SENSOR] ADXL345 Berhasil Diinisialisasi!\n");
 }
+
+static void adxl345_set_measure_mode(bool enable) {
+    uint8_t power_cmd[2] = {ADXL345_REG_POWER_CTL, enable ? 0x08 : 0x00};
+    esp_err_t err = i2c_master_write_to_device(I2C_MASTER_NUM, ADXL345_ADDR, power_cmd, sizeof(power_cmd), 1000 / portTICK_PERIOD_MS);
+    if (err == ESP_OK) {
+        printf("[SENSOR] ADXL345 diatur ke mode: %s\n", enable ? "MEASURE (Aktif)" : "STANDBY (Hemat Daya)");
+    } else {
+        printf("[SENSOR ERROR] Gagal mengatur mode ADXL345: %s\n", esp_err_to_name(err));
+    }
+}
 // =======================================================================
 
 
@@ -141,6 +154,10 @@ static int ota_gatt_ctrl_cb(uint16_t conn_handle, uint16_t attr_handle,
 
         if (cmd == 0x01) { 
             printf("\n[OTA] Menerima perintah START (0x01)\n");
+            adxl345_set_measure_mode(false); // Matikan pengukuran sensor selama FOTA
+            #if CONFIG_PM_ENABLE
+            esp_pm_lock_acquire(ota_pm_lock);
+            #endif
             update_partition = esp_ota_get_next_update_partition(NULL);
             if (update_partition == NULL) {
                 printf("[OTA] Error: Partisi OTA tidak ditemukan!\n");
@@ -161,6 +178,9 @@ static int ota_gatt_ctrl_cb(uint16_t conn_handle, uint16_t attr_handle,
         else if (cmd == 0x02) { 
             if (!ota_is_running) return BLE_ATT_ERR_UNLIKELY;
             printf("\n[OTA] Menerima perintah END (0x02). Total data: %d bytes\n", ota_total_bytes);
+            #if CONFIG_PM_ENABLE
+                esp_pm_lock_release(ota_pm_lock);
+            #endif
             
             esp_err_t err = esp_ota_end(ota_handle);
             if (err != ESP_OK) {
@@ -200,6 +220,7 @@ static int ota_gatt_data_cb(uint16_t conn_handle, uint16_t attr_handle,
             printf("[OTA] Gagal menulis ke Flash: %s\n", esp_err_to_name(err));
             esp_ota_abort(ota_handle);
             ota_is_running = false;
+            adxl345_set_measure_mode(true); // Aktifkan kembali sensor jika FOTA gagal
             return BLE_ATT_ERR_UNLIKELY;
         }
         
@@ -241,7 +262,6 @@ static const struct ble_gatt_svc_def gatt_svr_svcs[] = {
                 .access_cb = ota_gatt_data_cb,
                 .flags = BLE_GATT_CHR_F_WRITE_NO_RSP, 
             },
-            // --- PENYESUAIAN SISTEM 3: MENAMBAHKAN KARAKTERISTIK VERSI ---
             {
                 .uuid = &ota_chr_ver_uuid.u,
                 .access_cb = ota_gatt_ver_cb,
@@ -259,6 +279,7 @@ static int ble_gap_event_cb(struct ble_gap_event *event, void *arg) {
             if (event->connect.status == 0) {
                 printf("Gateway Connected!\n");
                 target_conn_handle = event->connect.conn_handle;
+                adxl345_set_measure_mode(true); // Aktifkan penginderaan sensor saat terhubung
             } else {
                 ble_app_advertise(); 
             }
@@ -267,6 +288,7 @@ static int ble_gap_event_cb(struct ble_gap_event *event, void *arg) {
         case BLE_GAP_EVENT_DISCONNECT:
             printf("Gateway Disconnected!\n");
             target_conn_handle = BLE_HS_CONN_HANDLE_NONE;
+            adxl345_set_measure_mode(false); // Matikan penginderaan sensor saat tidak terhubung
             ble_app_advertise(); 
             break;
 
@@ -301,6 +323,9 @@ static void ble_app_advertise(void) {
     memset(&adv_params, 0, sizeof adv_params);
     adv_params.conn_mode = BLE_GAP_CONN_MODE_UND; 
     adv_params.disc_mode = BLE_GAP_DISC_MODE_GEN; 
+    // Optimasi interval iklan agar hemat daya (1.0s - 2.0s)
+    adv_params.itvl_min = 1600; // 1600 * 0.625ms = 1000ms
+    adv_params.itvl_max = 3200; // 3200 * 0.625ms = 2000ms
 
     ble_gap_adv_start(own_addr_type, NULL, BLE_HS_FOREVER, &adv_params, ble_gap_event_cb, NULL);
     printf("SHM Node advertising...\n");
@@ -370,6 +395,19 @@ void app_main(void) {
         nvs_flash_init();
     }
 
+    #if CONFIG_PM_ENABLE
+        esp_pm_config_t pm_config = {
+            .max_freq_mhz = 80,        // Diturunkan ke 80MHz untuk hemat daya saat CPU aktif
+            .min_freq_mhz = 40,        // Frekuensi minimal saat idle
+            .light_sleep_enable = true // Mengaktifkan Automatic Light Sleep (ALS)
+        };
+        ESP_ERROR_CHECK(esp_pm_configure(&pm_config));
+
+        // Membuat Power Lock untuk menahan sleep saat FOTA berjalan
+        ESP_ERROR_CHECK(esp_pm_lock_create(ESP_PM_NO_LIGHT_SLEEP, 0, "ota_lock", &ota_pm_lock));
+        printf("[POWER] Automatic Light Sleep (ALS) Aktif!\n");
+    #endif
+
     adc_oneshot_unit_init_cfg_t init_config1 = {
         .unit_id = ADC_UNIT_1,
     };
@@ -380,6 +418,19 @@ void app_main(void) {
         .atten = ADC_ATTEN_DB_12,         
     };
     ESP_ERROR_CHECK(adc_oneshot_config_channel(adc1_handle, ADC_CHANNEL_1, &config));
+
+    // === MEMATIKAN LED INDIKATOR STATUS (GPIO 8) ===
+    gpio_config_t io_conf = {
+        .pin_bit_mask = (1ULL << 8),
+        .mode = GPIO_MODE_OUTPUT,
+        .pull_up_en = GPIO_PULLUP_DISABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_DISABLE,
+    };
+    gpio_config(&io_conf);
+    // LED bawaan pada ESP32-C3 SuperMini biasanya active-low (HIGH = OFF).
+    // Ubah menjadi 0 jika board Anda bertipe active-high.
+    gpio_set_level(8, 1);
 
     ESP_ERROR_CHECK(i2c_master_init());
 
